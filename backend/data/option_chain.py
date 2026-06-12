@@ -40,6 +40,7 @@ class OptionChainFetcher:
         self._session.headers.update(NSE_HEADERS)
         self._cookies_ts = 0.0
         self._cache: dict[str, tuple[float, pd.DataFrame, float]] = {}
+        self.last_expiry: dict[str, str] = {}   # underlying -> nearest expiry
 
     def _warm_cookies(self) -> None:
         if time.time() - self._cookies_ts < 300:
@@ -73,6 +74,8 @@ class OptionChainFetcher:
         records = payload.get("records", {})
         spot = float(records.get("underlyingValue") or 0.0)
         nearest_expiry = (records.get("expiryDates") or [None])[0]
+        if nearest_expiry:
+            self.last_expiry[underlying] = nearest_expiry
         rows = []
         for item in records.get("data", []):
             if item.get("expiryDate") != nearest_expiry:
