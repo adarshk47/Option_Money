@@ -55,7 +55,7 @@ class Settings:
     refresh_seconds: int = int(os.getenv("REFRESH_SECONDS", 5))
 
     # Markets we trade (options buying only)
-    watchlist: tuple = ("NIFTY", "BANKNIFTY", "SENSEX", "SBIN")
+    watchlist: tuple = ("NIFTY", "SENSEX", "SBIN")
     timeframes: tuple = ("1min", "5min", "10min", "15min", "20min")
 
     @property

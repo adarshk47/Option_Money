@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -74,8 +74,20 @@ CREATE TABLE IF NOT EXISTS user_settings (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS oi_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    underlying TEXT NOT NULL,
+    ce_oi REAL,
+    pe_oi REAL,
+    ce_chg_oi REAL,
+    pe_chg_oi REAL,
+    spot REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE INDEX IF NOT EXISTS idx_oi_hist ON oi_history(underlying, ts);
 """
 
 
@@ -158,6 +170,32 @@ class Database:
                 "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── OI history (intraday snapshots, kept ~2 days) ──────────────
+
+    def insert_oi(self, underlying: str, ce_oi: float, pe_oi: float,
+                  ce_chg_oi: float, pe_chg_oi: float, spot: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO oi_history
+                   (ts, underlying, ce_oi, pe_oi, ce_chg_oi, pe_chg_oi, spot)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(), underlying, ce_oi, pe_oi,
+                 ce_chg_oi, pe_chg_oi, spot),
+            )
+
+    def oi_history(self, underlying: str, since_iso: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM oi_history WHERE underlying=? AND ts>=? "
+                "ORDER BY ts", (underlying, since_iso),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def purge_oi(self, keep_days: int = 2) -> None:
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM oi_history WHERE ts < ?", (cutoff,))
 
     # ── Backtests / settings ───────────────────────────────────────
 

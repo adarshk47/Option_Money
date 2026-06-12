@@ -61,6 +61,25 @@ class TradeManager:
             contract=contract, premium=premium,
         )
 
+    def manual_buy(self, underlying: str, option_type: str, spot: float,
+                   reason: str = "Manual chart trade") -> tuple[bool, str]:
+        """One-click BUY from the dashboard (paper or live per settings)."""
+        try:
+            ok = self._enter(
+                underlying=underlying, option_type=option_type, spot=spot,
+                sl_pct=settings.default_sl_percent,
+                t1_pct=settings.default_target1_percent,
+                t2_pct=settings.default_target2_percent, reason=reason,
+            )
+            if ok:
+                return True, f"BUY {underlying} {option_type} placed ({settings.trading_mode})"
+            return False, ("Trade not placed — broker connection needed to "
+                           "price the ATM option (or risk limits hit)")
+        except Exception:  # noqa: BLE001
+            log.exception("Manual buy failed")
+            return False, ("Trade failed — connect the broker first (option "
+                           "contract/premium data needed). See logs for detail.")
+
     def _enter(self, underlying: str, option_type: str, spot: float,
                sl_pct: float, t1_pct: float, t2_pct: float, reason: str,
                contract: Optional[dict] = None,
