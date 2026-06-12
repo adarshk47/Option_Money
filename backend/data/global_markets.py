@@ -20,8 +20,19 @@ TICKERS = {
     "S&P 500": "^GSPC",
     "DOW": "^DJI",
     "NASDAQ": "^IXIC",
+    "DOW FUT": "YM=F",
+    "S&P FUT": "ES=F",
+    "NASDAQ FUT": "NQ=F",
     "NIKKEI": "^N225",
     "HANG SENG": "^HSI",
+}
+
+# Which session clock each ticker follows (for the open/closed dot)
+MARKET_GROUP = {
+    "NIFTY 50": "IN", "BANKNIFTY": "IN", "SENSEX": "IN", "INDIA VIX": "IN",
+    "S&P 500": "US", "DOW": "US", "NASDAQ": "US",
+    "DOW FUT": "FUT", "S&P FUT": "FUT", "NASDAQ FUT": "FUT",
+    "NIKKEI": "JP", "HANG SENG": "HK",
 }
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}

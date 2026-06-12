@@ -2,16 +2,19 @@
 OptionMoney AI — Streamlit web dashboard.
 
 Layout:
-  • Global ticker strip (Indian indices + world markets) at the top
-  • Live IST clock + which trading session is running right now
+  • Global ticker (Indian indices + world markets + US futures) with a
+    live open/closed dot per market, refreshed every 30 s
+  • IST clock + which trading session is running right now
   • One tab per instrument (NIFTY / SENSEX / SBIN):
-      chart with AI-recommendation pins (past + current), expiry info,
-      one-click paper-trade buttons, OI flow monitor with selectable
-      window (1–360 min) persisted to SQLite, OI-based trend verdict,
-      option chain analytics, OI heatmap, historical pattern matcher
-  • Separate Paper Trades tab (PnL, positions, signals, history)
+      one-line AI prediction, chart with price hover/crosshair, current
+      price line and recommendation pins (past + current), one-click
+      paper-trade buttons, OI flow with selectable window (1–360 min,
+      persisted to SQLite, offline fallback), option chain analytics,
+      OI heatmap, and a multi-year history pattern matcher backed by a
+      local cache file that backfills toward 5 years automatically
+  • Separate Paper Trades tab
 
-No login — runs open. Credentials come from st.secrets / .env.
+No login. Credentials come from st.secrets / .env.
 Run:  streamlit run streamlit_app/app.py
 """
 from __future__ import annotations
@@ -50,7 +53,8 @@ from ai_engine.recommendation_engine import recommendation_engine
 from backend.broker.angel_one import broker
 from backend.broker.paper_broker import paper_broker
 from backend.config import settings
-from backend.data.global_markets import global_quotes
+from backend.data.global_markets import MARKET_GROUP, global_quotes
+from backend.data.history_store import coverage_days, get_history
 from backend.data.option_chain import option_chain_fetcher
 from database.db import db
 from engine.trade_manager import trade_manager
@@ -61,10 +65,13 @@ OI_WINDOWS = [1, 2, 5, 10, 30, 60, 120, 240, 360]   # minutes
 st.set_page_config(page_title="OptionMoney AI", page_icon="📈",
                    layout="wide", initial_sidebar_state="expanded")
 
-# one-time housekeeping per session: keep OI history ~2 days
+# one-time housekeeping per session
 if "oi_purged" not in st.session_state:
     db.purge_oi(keep_days=2)
     st.session_state.oi_purged = True
+if broker.is_connected is False and "auto_login_tried" not in st.session_state:
+    st.session_state.auto_login_tried = True
+    broker.login()   # try auto-connect from secrets/.env on first load
 
 # ── Sidebar ─────────────────────────────────────────────────────────
 st.sidebar.title("⚙️ Controls")
@@ -108,57 +115,68 @@ def fetch_candles(name: str, tf: str, days: int = 5) -> pd.DataFrame:
 
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_chain(name: str):
-    df, spot = option_chain_fetcher.fetch(name)
+    try:
+        df, spot = option_chain_fetcher.fetch(name)
+    except Exception:
+        df, spot = pd.DataFrame(), 0.0
     return df, spot, option_chain_fetcher.last_expiry.get(name, "")
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)   # live ticker refresh
 def fetch_global():
     return global_quotes()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_history_30d(name: str) -> pd.DataFrame:
-    """30 days of 5-min candles for the pattern matcher."""
-    if not broker.is_connected:
-        return pd.DataFrame()
+def fetch_history_long(name: str) -> pd.DataFrame:
+    """Multi-year 5-min history (cache file backfills 2 chunks per call)."""
     try:
-        return broker.get_candles(name, "5min", days=30)
+        return get_history(name, years=5, backfill_chunks=2)
     except Exception:
         return pd.DataFrame()
 
 
-_DEMO_BASE = {"NIFTY": 25000.0, "SENSEX": 82000.0, "SBIN": 880.0}
+def _parse_expiry(s: str):
+    for fmt in ("%d-%b-%Y", "%d%b%Y", "%d-%b-%y"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
-def demo_candles(name: str, tf: str, bars: int = 300) -> pd.DataFrame:
-    rng = np.random.default_rng(abs(hash(name)) % 2**32)
-    base = _DEMO_BASE.get(name, 1000.0)
-    close = np.cumsum(rng.normal(0, base * 0.0006, bars)) + base
-    openp = np.roll(close, 1)
-    openp[0] = close[0]
-    idx = pd.date_range(end=pd.Timestamp.now().floor("min"),
-                        periods=bars, freq=tf)
-    return pd.DataFrame({
-        "open": openp,
-        "high": np.maximum(openp, close) + rng.uniform(0, base * 0.0008, bars),
-        "low": np.minimum(openp, close) - rng.uniform(0, base * 0.0008, bars),
-        "close": close,
-        "volume": rng.integers(10_000, 90_000, bars).astype(float),
-    }, index=idx)
+# ── Header: global ticker with open/closed dots + session clock ─────
+def _market_open(group: str, now: datetime) -> bool:
+    wd, t = now.weekday(), now.time()
+    if group == "FUT":   # US index futures: ~23h Mon–Fri (IST view)
+        return wd < 5 or (wd == 5 and t <= dtime(2, 30))
+    if wd >= 5:
+        return False
+    if group == "IN":
+        return dtime(9, 15) <= t <= dtime(15, 30)
+    if group == "US":    # NYSE 09:30–16:00 ET ≈ 19:00–01:30 IST
+        return t >= dtime(19, 0) or t <= dtime(1, 30)
+    if group == "JP":    # Tokyo ≈ 05:45–11:30 IST
+        return dtime(5, 45) <= t <= dtime(11, 30)
+    if group == "HK":    # Hong Kong ≈ 06:45–13:30 IST
+        return dtime(6, 45) <= t <= dtime(13, 30)
+    return False
 
 
-# ── Header: global ticker + session clock ───────────────────────────
 def render_header() -> None:
     quotes = fetch_global()
-    cols = st.columns(len(quotes))
-    for col, (name, q) in zip(cols, quotes.items()):
-        if q:
-            col.metric(name, f"{q['price']:,.0f}", f"{q['chg_pct']:+.2f}%")
-        else:
-            col.metric(name, "—")
-
     now = datetime.now(IST)
+    items = list(quotes.items())
+    for start in range(0, len(items), 6):       # rows of 6 tickers
+        cols = st.columns(6)
+        for col, (name, q) in zip(cols, items[start:start + 6]):
+            dot = "🟢" if _market_open(MARKET_GROUP.get(name, ""), now) else "🔴"
+            if q:
+                col.metric(f"{dot} {name}", f"{q['price']:,.0f}",
+                           f"{q['chg_pct']:+.2f}%")
+            else:
+                col.metric(f"{dot} {name}", "—")
+
     wd, t = now.weekday(), now.time()
     if wd >= 5:
         nse = "🔴 CLOSED (weekend)"
@@ -172,13 +190,14 @@ def render_header() -> None:
         nse = "🔴 CLOSED"
 
     live_now = []
-    if wd < 5:
-        if dtime(5, 30) <= t <= dtime(11, 30):
-            live_now.append("Asia (Nikkei/Hang Seng)")
-        if dtime(12, 30) <= t <= dtime(21, 0):
-            live_now.append("Europe")
-        if t >= dtime(19, 0) or t <= dtime(1, 30):
-            live_now.append("US (Dow/Nasdaq)")
+    if _market_open("JP", now):
+        live_now.append("Asia (Nikkei)")
+    if _market_open("HK", now):
+        live_now.append("Hong Kong")
+    if _market_open("US", now):
+        live_now.append("US (Dow/Nasdaq)")
+    if not live_now and _market_open("FUT", now):
+        live_now.append("US futures")
     extra = f" · Abhi live: **{', '.join(live_now)}**" if live_now else ""
     st.markdown(f"🕒 **{now.strftime('%d %b %Y, %H:%M:%S IST')}** · "
                 f"NSE: **{nse}**{extra}")
@@ -186,7 +205,6 @@ def render_header() -> None:
 
 # ── OI flow with persistent history ─────────────────────────────────
 def _store_oi_snapshot(name: str, chain: pd.DataFrame, spot: float) -> None:
-    """Persist ~1 snapshot/minute to SQLite (survives reruns/restarts)."""
     if chain.empty:
         return
     key = f"last_oi_store_{name}"
@@ -203,8 +221,7 @@ def _store_oi_snapshot(name: str, chain: pd.DataFrame, spot: float) -> None:
         st.session_state[key] = now
 
 
-def _window_delta(rows: list[dict], minutes: int) -> tuple[float, float] | None:
-    """(ΔCE, ΔPE) between the latest snapshot and one `minutes` ago."""
+def _window_delta(rows: list[dict], minutes: int):
     if len(rows) < 2:
         return None
     latest = rows[-1]
@@ -240,15 +257,14 @@ def render_oi_flow(name: str, chain: pd.DataFrame, spot: float,
                    expiry: str) -> None:
     st.subheader("📡 OI flow & market trend")
     if chain.empty:
-        st.info("Option chain not available for this instrument "
-                "(SENSEX/BFO needs broker chain data).")
+        st.info("Option chain unavailable — connect the broker (sidebar). "
+                "SENSEX/SBIN chains load from Angel One quotes once connected.")
         return
 
-    market_open = (datetime.now(IST).weekday() < 5
-                   and dtime(9, 15) <= datetime.now(IST).time() <= dtime(15, 30))
-    st.caption(f"Weekly expiry: **{expiry or '—'}** · spot {spot:,.1f}"
+    market_open = _market_open("IN", datetime.now(IST))
+    st.caption(f"Current expiry: **{expiry or '—'}** · spot {spot:,.1f}"
                + ("" if market_open
-                  else " · 🌙 market offline — showing **last available** NSE data"))
+                  else " · 🌙 market offline — showing **last available** data"))
 
     _store_oi_snapshot(name, chain, spot)
     since = (datetime.now() - timedelta(hours=30)).isoformat()
@@ -266,17 +282,17 @@ def render_oi_flow(name: str, chain: pd.DataFrame, spot: float,
         c.metric("Net flow (PE−CE)", f"{(dpe - dce):+,.0f}")
         st.markdown(f"### {dot} Current market trend (OI-based): **{trend}**")
     else:
-        # market offline / first run: fall back to NSE's day change-in-OI
-        dce, dpe = float(chain["ce_chg_oi"].sum()), float(chain["pe_chg_oi"].sum())
+        dce = float(chain["ce_chg_oi"].sum())
+        dpe = float(chain["pe_chg_oi"].sum())
         a, b, c = st.columns(3)
         a.metric("CE OI Δ (day)", f"{dce:+,.0f}")
         b.metric("PE OI Δ (day)", f"{dpe:+,.0f}")
         trend, dot = _oi_trend(dce, dpe)
         c.metric("Net flow (PE−CE)", f"{(dpe - dce):+,.0f}")
         st.markdown(f"### {dot} Last session's trend (day OI change): **{trend}**")
-        st.caption("Live 1-min tracking starts automatically when snapshots "
-                   "accumulate (collected every minute while this app runs; "
-                   "saved to the database until night cleanup).")
+        st.caption("Live windowed tracking builds up automatically — one "
+                   "snapshot per minute is saved to the database while the "
+                   "app runs (kept ~2 days).")
 
     if rows:
         hist_df = pd.DataFrame(rows)
@@ -294,31 +310,32 @@ def render_oi_flow(name: str, chain: pd.DataFrame, spot: float,
 # ── Pattern matcher panel ───────────────────────────────────────────
 def render_pattern_match(name: str, expiry: str) -> None:
     st.subheader("🔮 History pattern match (analog days)")
-    hist = fetch_history_30d(name)
+    hist = fetch_history_long(name)
     if hist.empty:
-        st.info("Needs broker connection + 30 days of 5-min history.")
+        st.info("Needs the broker connected — history cache builds "
+                "automatically once connected (target ~5 years of 5-min data).")
         return
 
+    days = coverage_days(hist)
     expiry_weekday = None
-    note = "matched against the last ~30 trading days"
-    try:
-        exp_date = pd.to_datetime(expiry, format="%d-%b-%Y").date()
-        if exp_date == datetime.now(IST).date():
-            expiry_weekday = exp_date.weekday()
-            note = ("**EXPIRY DAY** — matched only against past expiry-weekday "
-                    "days (same structural behaviour)")
-    except (ValueError, TypeError):
-        pass
+    mode_note = f"history cache: **{days} trading days** (target ~5 years, backfills automatically)"
+    exp_date = _parse_expiry(expiry)
+    if exp_date and exp_date == datetime.now(IST).date():
+        expiry_weekday = exp_date.weekday()
+        mode_note = ("**EXPIRY DAY** — matching only past expiry-weekday days · "
+                     + mode_note)
 
     result = find_analog_days(hist, top_n=3, expiry_weekday=expiry_weekday)
     if not result.get("available"):
         st.info(result.get("reason", "No match available yet."))
+        st.caption(mode_note)
         return
 
-    st.caption(f"Today so far: **{result['today_move_pct']:+.2f}%** · {note}")
+    st.caption(f"Today so far: **{result['today_move_pct']:+.2f}%** · {mode_note}")
     for m in result["matches"]:
+        match_day = pd.Timestamp(m["date"]).strftime("%a %d %b %Y")
         st.markdown(
-            f"• **{m['date']}** — similarity {m['similarity']}% · that day was "
+            f"• **{match_day}** — similarity {m['similarity']}% · that day was "
             f"{m['move_so_far_pct']:+.2f}% at this point, then moved "
             f"**{m['rest_of_day_pct']:+.2f}%** till close "
             f"(day total {m['day_close_pct']:+.2f}%)")
@@ -331,7 +348,6 @@ def render_pattern_match(name: str, expiry: str) -> None:
 
 # ── Per-instrument tab ──────────────────────────────────────────────
 def _save_dashboard_signal(name: str, tf: str, rec) -> None:
-    """Persist actionable recommendations once per candle (for chart pins)."""
     if not rec.option_type or rec.confidence < 60:
         return
     key = f"saved_sig_{name}_{tf}"
@@ -348,8 +364,7 @@ def _save_dashboard_signal(name: str, tf: str, rec) -> None:
 
 
 def _signal_pins(name: str, dfi: pd.DataFrame) -> pd.DataFrame:
-    """Past signals for this underlying that fall inside the chart window."""
-    sigs = pd.DataFrame(db.recent_signals(200))
+    sigs = pd.DataFrame(db.recent_signals(300))
     if sigs.empty:
         return sigs
     sigs = sigs[(sigs["underlying"] == name)
@@ -365,36 +380,41 @@ def render_instrument(name: str, tf: str) -> None:
     df = fetch_candles(name, tf)
     chain, chain_spot, expiry = fetch_chain(name)
 
-    is_demo = df.empty
-    if is_demo:
-        df = demo_candles(name, tf)
-        st.info("📡 No live candles right now (broker not connected / market "
-                "closed / API busy) — showing **DEMO data**, switches to live "
-                "automatically." if broker.is_connected else
-                "🔌 Broker not connected — **DEMO data**. Connect from the sidebar.")
+    if df.empty:
+        st.error(f"❌ No {name} candle data. Connect the broker from the "
+                 "sidebar (Angel One credentials in Streamlit secrets / .env). "
+                 "Retries automatically every refresh.")
+        # still show whatever option-chain data we have
+        render_oi_flow(name, chain, chain_spot, expiry)
+        return
 
     dfi = add_all_indicators(df)
     rec = recommendation_engine.analyse(name, df, tf, option_chain=chain,
                                         chain_spot=chain_spot)
-    if not is_demo:
-        _save_dashboard_signal(name, tf, rec)
+    _save_dashboard_signal(name, tf, rec)
+    last_close = float(dfi["close"].iloc[-1])
 
-    # ── Price + signal strip ────────────────────────────────────────
-    colour = ("green" if rec.option_type == "CE"
-              else "red" if rec.option_type == "PE" else "gray")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric(f"{name} spot", f"{rec.spot:,.1f}")
-    c2.markdown(f"### :{colour}[{rec.action}]" + (" `DEMO`" if is_demo else ""))
-    c3.metric("Confidence", f"{rec.confidence}%")
-    c4.metric("Risk:Reward", rec.risk_reward if rec.option_type else "—")
-    c5.metric("Risk level", rec.risk_level)
-    c6.metric("Weekly expiry", expiry or "—")
+    # ── Metrics + ONE-LINE prediction ──────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(f"{name} spot", f"{last_close:,.1f}")
+    c2.metric("Confidence", f"{rec.confidence}%")
+    c3.metric("Risk:Reward", rec.risk_reward if rec.option_type else "—")
+    c4.metric("Risk level", rec.risk_level)
+    c5.metric("Current expiry", expiry or "—")
 
+    emoji = ("🟢" if rec.option_type == "CE"
+             else "🔴" if rec.option_type == "PE" else "⚪")
     if rec.option_type:
-        st.success(f"**Entry (spot)** {rec.entry_price} | **SL** {rec.stop_loss} "
-                   f"| **T1** {rec.target1} | **T2** {rec.target2}")
+        st.markdown(
+            f"### {emoji} **{rec.action}** · Entry(spot) **{rec.entry_price}** "
+            f"| SL **{rec.stop_loss}** | T1 **{rec.target1}** "
+            f"| T2 **{rec.target2}** · Confidence **{rec.confidence}%** "
+            f"· [{tf}]")
+    else:
+        top_reason = rec.reasoning[0] if rec.reasoning else ""
+        st.markdown(f"### {emoji} **{rec.action}** — {top_reason} · [{tf}]")
 
-    # ── Chart with recommendation pins ─────────────────────────────
+    # ── Chart: hover price, current-price line, signal pins ────────
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
                         row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
     fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["open"],
@@ -407,18 +427,22 @@ def render_instrument(name: str, tf: str) -> None:
                              name="Supertrend", line=dict(width=1.5)),
                   row=1, col=1)
 
-    pins = pd.DataFrame() if is_demo else _signal_pins(name, dfi)
+    # current price line with label
+    fig.add_hline(y=last_close, line_dash="dot", line_color="gray",
+                  annotation_text=f"  {last_close:,.1f}",
+                  annotation_position="right", row=1, col=1)
+
+    # past signal pins from the database
+    pins = _signal_pins(name, dfi)
     if not pins.empty:
         is_ce = pins["action"].str.contains("CE")
         fig.add_trace(go.Scatter(
             x=pins["ts"], y=pins["entry_price"], mode="markers",
             name="AI signals",
-            marker=dict(
-                size=13,
-                symbol=np.where(is_ce, "triangle-up", "triangle-down"),
-                color=np.where(is_ce, "lime", "red"),
-                line=dict(width=1, color="black"),
-            ),
+            marker=dict(size=14,
+                        symbol=np.where(is_ce, "triangle-up", "triangle-down"),
+                        color=np.where(is_ce, "lime", "red"),
+                        line=dict(width=1, color="black")),
             hovertemplate=("<b>%{customdata[0]}</b><br>%{x|%d %b %H:%M}<br>"
                            "Entry %{y:.1f} | SL %{customdata[1]} | "
                            "T1 %{customdata[2]}<br>Confidence %{customdata[3]}%"
@@ -427,30 +451,52 @@ def render_instrument(name: str, tf: str) -> None:
                              "confidence"]].to_numpy(),
         ), row=1, col=1)
 
+    # current recommendation pin (star on the latest candle)
+    if rec.option_type:
+        fig.add_trace(go.Scatter(
+            x=[dfi.index[-1]], y=[rec.entry_price], mode="markers+text",
+            name="Now", text=[rec.action], textposition="top center",
+            marker=dict(size=16, symbol="star",
+                        color="lime" if rec.option_type == "CE" else "red",
+                        line=dict(width=1, color="black")),
+            hovertemplate=(f"<b>{rec.action}</b> (current)<br>Entry "
+                           f"{rec.entry_price} | SL {rec.stop_loss} | "
+                           f"T1 {rec.target1}<extra></extra>"),
+        ), row=1, col=1)
+
     fig.add_trace(go.Bar(x=dfi.index, y=dfi["volume"], name="Volume"),
                   row=2, col=1)
     fig.add_trace(go.Scatter(x=dfi.index, y=dfi["rsi"], name="RSI"),
                   row=3, col=1)
     fig.add_hline(y=70, line_dash="dot", row=3, col=1)
     fig.add_hline(y=30, line_dash="dot", row=3, col=1)
+
+    # hide nights/weekends so candles join up like a trading terminal
+    fig.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(bounds=[15.6, 9.25], pattern="hour"),
+    ])
     fig.update_layout(height=620, xaxis_rangeslider_visible=False,
-                      margin=dict(l=10, r=10, t=30, b=10), showlegend=True)
+                      hovermode="x unified",
+                      margin=dict(l=10, r=60, t=30, b=10), showlegend=True)
+    fig.update_xaxes(showspikes=True, spikemode="across", spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikethickness=1)
     st.plotly_chart(fig, use_container_width=True, key=f"chart_{name}")
 
-    # ── One-click paper trade at the chart ─────────────────────────
+    # ── One-click paper trade ──────────────────────────────────────
     t1, t2, t3 = st.columns([1, 1, 3])
     if t1.button(f"🟢 Buy {name} CE (paper)", key=f"buyce_{name}",
                  use_container_width=True):
-        ok, msg = trade_manager.manual_buy(name, "CE", rec.spot,
+        ok, msg = trade_manager.manual_buy(name, "CE", last_close,
                                            reason="One-click chart trade")
         (st.success if ok else st.error)(msg)
     if t2.button(f"🔴 Buy {name} PE (paper)", key=f"buype_{name}",
                  use_container_width=True):
-        ok, msg = trade_manager.manual_buy(name, "PE", rec.spot,
+        ok, msg = trade_manager.manual_buy(name, "PE", last_close,
                                            reason="One-click chart trade")
         (st.success if ok else st.error)(msg)
     t3.caption("Buys 1 ATM lot within your capital limit, with default "
-               "SL/T1/T2 — manage it in the Paper Trades tab.")
+               "SL/T1/T2 — manage in the Paper Trades tab.")
 
     with st.expander("🧠 AI reasoning", expanded=False):
         for r in rec.reasoning:

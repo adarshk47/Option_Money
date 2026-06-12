@@ -195,6 +195,30 @@ class AngelOneClient:
             )
         return df
 
+    @_retry()
+    def get_candles_range(self, name: str, interval: str,
+                          from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """Historical candles for an explicit date range (for backfills)."""
+        self.ensure_session()
+        meta = INSTRUMENTS[name]
+        params = {
+            "exchange": meta["exchange"],
+            "symboltoken": meta["token"],
+            "interval": _INTERVAL_MAP[interval],
+            "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
+        }
+        with self._api_lock:
+            data = self.api.getCandleData(params)
+        if not data or not data.get("data"):
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            data["data"],
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df.set_index("timestamp").astype(float)
+
     # ── Orders / portfolio ─────────────────────────────────────────
 
     @_retry(max_attempts=2)

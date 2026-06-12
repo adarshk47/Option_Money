@@ -53,14 +53,27 @@ class OptionChainFetcher:
 
     def fetch(self, underlying: str,
               max_age: float = 60.0) -> tuple[pd.DataFrame, float]:
-        """Returns (chain_df, spot). Cached for `max_age` seconds."""
+        """Returns (chain_df, spot). Cached for `max_age` seconds.
+
+        Source order: NSE public chain → Angel One quotes (works for
+        SENSEX/BFO and when NSE blocks cloud IPs) → last cached copy.
+        """
         cached = self._cache.get(underlying)
         if cached and time.time() - cached[0] < max_age:
             return cached[1], cached[2]
 
+        df, spot = self._fetch_nse(underlying)
+        if df.empty:
+            df, spot = self._fetch_via_broker(underlying)
+        if df.empty and cached:
+            return cached[1], cached[2]
+        if not df.empty:
+            self._cache[underlying] = (time.time(), df, spot)
+        return df, spot
+
+    def _fetch_nse(self, underlying: str) -> tuple[pd.DataFrame, float]:
         url = _NSE_URL.get(underlying)
         if url is None:
-            log.info("No NSE chain for %s (use Angel One BFO data)", underlying)
             return pd.DataFrame(), 0.0
         try:
             self._warm_cookies()
@@ -68,8 +81,8 @@ class OptionChainFetcher:
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("Option chain fetch failed for %s: %s", underlying, exc)
-            return (cached[1], cached[2]) if cached else (pd.DataFrame(), 0.0)
+            log.warning("NSE option chain failed for %s: %s", underlying, exc)
+            return pd.DataFrame(), 0.0
 
         records = payload.get("records", {})
         spot = float(records.get("underlyingValue") or 0.0)
@@ -94,9 +107,67 @@ class OptionChainFetcher:
                 "pe_iv": pe.get("impliedVolatility", 0),
                 "pe_ltp": pe.get("lastPrice", 0),
             })
+        if not rows:
+            log.warning("NSE chain for %s came back empty", underlying)
+            return pd.DataFrame(), spot
         df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-        self._cache[underlying] = (time.time(), df, spot)
         return df, spot
+
+    def _fetch_via_broker(self, underlying: str) -> tuple[pd.DataFrame, float]:
+        """Build the chain from Angel One quotes (OI + LTP per strike)."""
+        from backend.broker.angel_one import broker
+        from backend.config import INSTRUMENTS
+        from backend.data.instruments import instrument_master
+
+        if not broker.is_connected:
+            return pd.DataFrame(), 0.0
+        try:
+            spot = broker.get_ltp(underlying) or 0.0
+            if spot <= 0:
+                return pd.DataFrame(), 0.0
+            opts = instrument_master.option_contracts(underlying)
+            if opts.empty:
+                return pd.DataFrame(), 0.0
+            self.last_expiry[underlying] = str(opts.iloc[0]["expiry"])
+            near = opts[(opts["strike"] - spot).abs() <= spot * 0.04]
+            exchange = INSTRUMENTS[underlying]["option_exchange"]
+
+            quotes: dict[str, dict] = {}
+            tokens = near["token"].astype(str).tolist()
+            for i in range(0, len(tokens), 40):   # API: ≤50 tokens/request
+                data = broker.api.getMarketData(
+                    "FULL", {exchange: tokens[i:i + 40]})
+                for item in ((data or {}).get("data") or {}).get("fetched", []):
+                    quotes[str(item.get("symbolToken"))] = item
+                time.sleep(0.35)                  # respect rate limits
+
+            recs: dict[float, dict] = {}
+            for _, r in near.iterrows():
+                strike = float(r["strike"])
+                d = recs.setdefault(strike, {
+                    "strike": strike,
+                    "ce_oi": 0, "ce_chg_oi": 0, "ce_volume": 0,
+                    "ce_iv": 0, "ce_ltp": 0,
+                    "pe_oi": 0, "pe_chg_oi": 0, "pe_volume": 0,
+                    "pe_iv": 0, "pe_ltp": 0,
+                })
+                q = quotes.get(str(r["token"]), {})
+                side = "ce" if r["option_type"] == "CE" else "pe"
+                d[f"{side}_ltp"] = float(q.get("ltp") or 0)
+                d[f"{side}_oi"] = float(q.get("opnInterest")
+                                        or q.get("openInterest") or 0)
+                d[f"{side}_volume"] = float(q.get("tradeVolume")
+                                            or q.get("tradedVolume") or 0)
+            if not recs:
+                return pd.DataFrame(), spot
+            df = (pd.DataFrame(list(recs.values()))
+                  .sort_values("strike").reset_index(drop=True))
+            log.info("Option chain for %s built from broker quotes "
+                     "(%d strikes)", underlying, len(df))
+            return df, float(spot)
+        except Exception:  # noqa: BLE001
+            log.exception("Broker option chain failed for %s", underlying)
+            return pd.DataFrame(), 0.0
 
 
 option_chain_fetcher = OptionChainFetcher()
