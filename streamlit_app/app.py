@@ -83,6 +83,8 @@ if st.sidebar.button("🔌 Connect broker"):
     with st.spinner("Logging in to Angel One..."):
         if broker.login():
             st.sidebar.success("Connected")
+            st.cache_data.clear()   # drop any cached empty results
+            st.rerun()
         else:
             st.sidebar.error("Login failed — check credentials in "
                              "Streamlit secrets (cloud) or .env (local)")
@@ -94,7 +96,10 @@ st.title(f"📈 {underlying} — AI Trading Dashboard")
 def fetch_candles(name: str, tf: str) -> pd.DataFrame:
     if not broker.is_connected and not broker.login():
         return pd.DataFrame()
-    return broker.get_candles(name, tf, days=5)
+    try:
+        return broker.get_candles(name, tf, days=5)
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -102,13 +107,46 @@ def fetch_chain(name: str):
     return option_chain_fetcher.fetch(name)
 
 
+_DEMO_BASE = {"NIFTY": 25000.0, "BANKNIFTY": 56000.0,
+              "SENSEX": 82000.0, "SBIN": 880.0}
+
+
+def demo_candles(name: str, tf: str, bars: int = 300) -> pd.DataFrame:
+    """Synthetic OHLCV so the dashboard is never blank while data loads."""
+    import numpy as np
+    rng = np.random.default_rng(abs(hash(name)) % 2**32)
+    base = _DEMO_BASE.get(name, 1000.0)
+    close = np.cumsum(rng.normal(0, base * 0.0006, bars)) + base
+    openp = np.roll(close, 1)
+    openp[0] = close[0]
+    idx = pd.date_range(end=pd.Timestamp.now().floor("min"),
+                        periods=bars, freq=tf.replace("min", "min"))
+    return pd.DataFrame({
+        "open": openp,
+        "high": np.maximum(openp, close) + rng.uniform(0, base * 0.0008, bars),
+        "low": np.minimum(openp, close) - rng.uniform(0, base * 0.0008, bars),
+        "close": close,
+        "volume": rng.integers(10_000, 90_000, bars).astype(float),
+    }, index=idx)
+
+
 df = fetch_candles(underlying, timeframe)
 chain, chain_spot = fetch_chain(underlying)
 
-if df.empty:
-    st.warning("No candle data. Connect the broker from the sidebar "
-               "(Angel One credentials required in .env / Streamlit secrets).")
-    st.stop()
+is_demo = df.empty
+if is_demo:
+    # don't cache the failure — retry on the next auto-refresh (30 s)
+    fetch_candles.clear()
+    df = demo_candles(underlying, timeframe)
+    if broker.is_connected:
+        st.info("📡 Broker connected, but no candle data returned yet "
+                "(market closed / API busy). Showing **DEMO data** — the page "
+                "auto-refreshes every 30 s and will switch to live data "
+                "automatically.")
+    else:
+        st.warning("🔌 Broker not connected — showing **DEMO data**. Connect "
+                   "from the sidebar (Angel One credentials in Streamlit "
+                   "secrets / .env) to load live candles.")
 
 dfi = add_all_indicators(df)
 rec = recommendation_engine.analyse(underlying, df, timeframe,
@@ -119,7 +157,8 @@ colour = ("green" if rec.option_type == "CE"
           else "red" if rec.option_type == "PE" else "gray")
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Spot", f"{rec.spot:,.1f}")
-c2.markdown(f"### :{colour}[{rec.action}]")
+c2.markdown(f"### :{colour}[{rec.action}]"
+            + (" `DEMO`" if is_demo else ""))
 c3.metric("Confidence", f"{rec.confidence}%")
 c4.metric("Risk:Reward", rec.risk_reward if rec.option_type else "—")
 c5.metric("Risk level", rec.risk_level)
