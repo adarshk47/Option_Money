@@ -8,14 +8,28 @@ Login: password = API_SECRET_KEY (.env locally, st.secrets on cloud).
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import streamlit as st
+
+# On Streamlit Cloud there is no .env file — copy st.secrets into the
+# process environment BEFORE backend.config is imported, so Angel One
+# credentials and API_SECRET_KEY work the same locally and on the cloud.
+try:
+    for _key in ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PASSWORD",
+                 "ANGEL_TOTP_SECRET", "API_SECRET_KEY", "TRADING_MODE",
+                 "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        if _key in st.secrets and _key not in os.environ:
+            os.environ[_key] = str(st.secrets[_key])
+except Exception:
+    pass  # no secrets configured — fall back to .env
+
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
 from plotly.subplots import make_subplots
 
 from ai_engine.indicators import add_all_indicators
@@ -67,8 +81,11 @@ st.sidebar.markdown(f"**Mode:** {mode_badge}")
 
 if st.sidebar.button("🔌 Connect broker"):
     with st.spinner("Logging in to Angel One..."):
-        st.sidebar.success("Connected") if broker.login() else \
-            st.sidebar.error("Login failed — check .env / secrets")
+        if broker.login():
+            st.sidebar.success("Connected")
+        else:
+            st.sidebar.error("Login failed — check credentials in "
+                             "Streamlit secrets (cloud) or .env (local)")
 
 st.title(f"📈 {underlying} — AI Trading Dashboard")
 
@@ -176,11 +193,15 @@ p4.metric("Trades today", snap["trades_today"])
 tab1, tab2 = st.tabs(["🚨 Recent AI signals", "📒 Trade history"])
 with tab1:
     sigs = db.recent_signals(25)
-    st.dataframe(pd.DataFrame(sigs), use_container_width=True) if sigs else \
+    if sigs:
+        st.dataframe(pd.DataFrame(sigs), use_container_width=True)
+    else:
         st.info("No signals stored yet — run the live engine.")
 with tab2:
     trades = db.recent_trades(25)
-    st.dataframe(pd.DataFrame(trades), use_container_width=True) if trades else \
+    if trades:
+        st.dataframe(pd.DataFrame(trades), use_container_width=True)
+    else:
         st.info("No trades yet.")
 
 st.caption("⚠️ Educational tool. Options trading carries substantial risk of "
