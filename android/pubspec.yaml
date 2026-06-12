@@ -1,0 +1,26 @@
+name: option_money
+description: OptionMoney AI — live AI options-buying signals for NIFTY / SENSEX / SBIN.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0                      # REST calls to the FastAPI backend
+  provider: ^6.1.0                  # state management
+  shared_preferences: ^2.2.0        # token + server URL storage
+  fl_chart: ^0.66.0                 # candlestick / line charts
+  flutter_local_notifications: ^17.0.0   # push-style signal alerts
+  flutter_tts: ^4.0.0               # voice alerts
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

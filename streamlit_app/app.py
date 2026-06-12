@@ -1,0 +1,187 @@
+"""
+OptionMoney AI — Streamlit web dashboard (mobile-responsive, cloud-deployable).
+
+Run locally:   streamlit run streamlit_app/app.py
+Deploy:        see docs/STREAMLIT_DEPLOY.md
+
+Login: password = API_SECRET_KEY (.env locally, st.secrets on cloud).
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from ai_engine.indicators import add_all_indicators
+from ai_engine.option_chain_analysis import analyse_option_chain
+from ai_engine.recommendation_engine import recommendation_engine
+from backend.broker.angel_one import broker
+from backend.broker.paper_broker import paper_broker
+from backend.config import settings
+from backend.data.option_chain import option_chain_fetcher
+from database.db import db
+
+st.set_page_config(page_title="OptionMoney AI", page_icon="📈",
+                   layout="wide", initial_sidebar_state="expanded")
+
+# ── Auth ────────────────────────────────────────────────────────────
+def _secret() -> str:
+    try:
+        return st.secrets.get("API_SECRET_KEY", settings.api_secret_key)
+    except Exception:
+        return settings.api_secret_key
+
+
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+if not st.session_state.authed:
+    st.title("📈 OptionMoney AI")
+    pwd = st.text_input("Access key", type="password")
+    if st.button("Login", type="primary"):
+        if pwd == _secret():
+            st.session_state.authed = True
+            st.rerun()
+        else:
+            st.error("Wrong access key")
+    st.stop()
+
+# ── Auto refresh ────────────────────────────────────────────────────
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=30_000, key="auto_refresh")
+except ImportError:
+    pass
+
+# ── Sidebar ─────────────────────────────────────────────────────────
+st.sidebar.title("⚙️ Controls")
+underlying = st.sidebar.selectbox("Instrument", settings.watchlist)
+timeframe = st.sidebar.selectbox("Timeframe", settings.timeframes, index=1)
+mode_badge = "🟢 PAPER" if settings.is_paper else "🔴 LIVE"
+st.sidebar.markdown(f"**Mode:** {mode_badge}")
+
+if st.sidebar.button("🔌 Connect broker"):
+    with st.spinner("Logging in to Angel One..."):
+        st.sidebar.success("Connected") if broker.login() else \
+            st.sidebar.error("Login failed — check .env / secrets")
+
+st.title(f"📈 {underlying} — AI Trading Dashboard")
+
+# ── Data fetch (cached) ─────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_candles(name: str, tf: str) -> pd.DataFrame:
+    if not broker.is_connected and not broker.login():
+        return pd.DataFrame()
+    return broker.get_candles(name, tf, days=5)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_chain(name: str):
+    return option_chain_fetcher.fetch(name)
+
+
+df = fetch_candles(underlying, timeframe)
+chain, chain_spot = fetch_chain(underlying)
+
+if df.empty:
+    st.warning("No candle data. Connect the broker from the sidebar "
+               "(Angel One credentials required in .env / Streamlit secrets).")
+    st.stop()
+
+dfi = add_all_indicators(df)
+rec = recommendation_engine.analyse(underlying, df, timeframe,
+                                    option_chain=chain, chain_spot=chain_spot)
+
+# ── Signal banner ───────────────────────────────────────────────────
+colour = ("green" if rec.option_type == "CE"
+          else "red" if rec.option_type == "PE" else "gray")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Spot", f"{rec.spot:,.1f}")
+c2.markdown(f"### :{colour}[{rec.action}]")
+c3.metric("Confidence", f"{rec.confidence}%")
+c4.metric("Risk:Reward", rec.risk_reward if rec.option_type else "—")
+c5.metric("Risk level", rec.risk_level)
+
+if rec.option_type:
+    st.success(f"**Entry (spot)** {rec.entry_price} | **SL** {rec.stop_loss} "
+               f"| **T1** {rec.target1} | **T2** {rec.target2}")
+with st.expander("🧠 AI reasoning", expanded=False):
+    for r in rec.reasoning:
+        st.write("•", r)
+
+# ── Chart ───────────────────────────────────────────────────────────
+fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                    row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
+fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["open"], high=dfi["high"],
+                             low=dfi["low"], close=dfi["close"], name="Price"),
+              row=1, col=1)
+for col, dash in (("ema9", "dot"), ("ema20", "dash"), ("vwap", "solid")):
+    fig.add_trace(go.Scatter(x=dfi.index, y=dfi[col], name=col.upper(),
+                             line=dict(width=1, dash=dash)), row=1, col=1)
+fig.add_trace(go.Scatter(x=dfi.index, y=dfi["supertrend"], name="Supertrend",
+                         line=dict(width=1.5)), row=1, col=1)
+fig.add_trace(go.Bar(x=dfi.index, y=dfi["volume"], name="Volume"), row=2, col=1)
+fig.add_trace(go.Scatter(x=dfi.index, y=dfi["rsi"], name="RSI"), row=3, col=1)
+fig.add_hline(y=70, line_dash="dot", row=3, col=1)
+fig.add_hline(y=30, line_dash="dot", row=3, col=1)
+fig.update_layout(height=650, xaxis_rangeslider_visible=False,
+                  margin=dict(l=10, r=10, t=30, b=10), showlegend=True)
+st.plotly_chart(fig, use_container_width=True)
+
+# ── Option chain + OI heatmap ───────────────────────────────────────
+left, right = st.columns([1, 1])
+with left:
+    st.subheader("🔗 Option chain analysis")
+    oc = analyse_option_chain(chain, chain_spot)
+    if oc.get("available"):
+        a, b, c = st.columns(3)
+        a.metric("PCR", oc["pcr"])
+        b.metric("Max pain", f"{oc['max_pain']:,.0f}")
+        c.metric("Dominance", oc["dominance"])
+        st.caption(f"OI support **{oc['oi_support']:,.0f}** · "
+                   f"OI resistance **{oc['oi_resistance']:,.0f}** · "
+                   f"{oc['oi_buildup']['pe_view']}")
+    else:
+        st.info("Option chain unavailable for this instrument right now.")
+
+with right:
+    st.subheader("🔥 OI heatmap (near ATM)")
+    if not chain.empty and chain_spot:
+        near = chain[(chain["strike"] - chain_spot).abs()
+                     <= chain_spot * 0.03]
+        heat = go.Figure()
+        heat.add_trace(go.Bar(x=near["strike"], y=near["ce_oi"],
+                              name="CE OI", marker_color="crimson"))
+        heat.add_trace(go.Bar(x=near["strike"], y=-near["pe_oi"],
+                              name="PE OI", marker_color="seagreen"))
+        heat.add_vline(x=chain_spot, line_dash="dash")
+        heat.update_layout(barmode="relative", height=300,
+                           margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(heat, use_container_width=True)
+
+# ── PnL + signals + trades ──────────────────────────────────────────
+st.subheader("💰 PnL (paper)")
+snap = paper_broker.snapshot()
+p1, p2, p3, p4 = st.columns(4)
+p1.metric("Realised today", f"₹{snap['realised_pnl_today']:,.0f}")
+p2.metric("Unrealised", f"₹{snap['unrealised_pnl']:,.0f}")
+p3.metric("Total today", f"₹{snap['total_pnl_today']:,.0f}")
+p4.metric("Trades today", snap["trades_today"])
+
+tab1, tab2 = st.tabs(["🚨 Recent AI signals", "📒 Trade history"])
+with tab1:
+    sigs = db.recent_signals(25)
+    st.dataframe(pd.DataFrame(sigs), use_container_width=True) if sigs else \
+        st.info("No signals stored yet — run the live engine.")
+with tab2:
+    trades = db.recent_trades(25)
+    st.dataframe(pd.DataFrame(trades), use_container_width=True) if trades else \
+        st.info("No trades yet.")
+
+st.caption("⚠️ Educational tool. Options trading carries substantial risk of "
+           "loss. Signals are probabilistic, not financial advice.")
