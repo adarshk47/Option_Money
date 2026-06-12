@@ -17,6 +17,13 @@ pyinstaller --noconfirm --onefile --windowed `
   main.py
 ```
 
+The backtick line-continuations above are **PowerShell-only**. In a plain
+Command Prompt (cmd.exe), run it as one line instead:
+
+```bat
+pyinstaller --noconfirm --onefile --windowed --name OptionMoneyAI --hidden-import SmartApi --hidden-import pyttsx3.drivers --hidden-import pyttsx3.drivers.sapi5 --hidden-import plyer.platforms.win.notification --collect-submodules sklearn main.py
+```
+
 Output: `dist/OptionMoneyAI.exe`.
 
 Notes:
