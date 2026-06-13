@@ -82,6 +82,10 @@ refresh_s = st.sidebar.selectbox("Refresh rate (seconds)", [3, 5, 10, 30],
                                  index=0)
 mode_badge = "🟢 PAPER" if settings.is_paper else "🔴 LIVE"
 st.sidebar.markdown(f"**Mode:** {mode_badge}")
+st.session_state["enable_backfill"] = st.sidebar.checkbox(
+    "Build 5-yr history cache (extra API load)", value=False,
+    help="Off by default so charts get the historical-API budget. Turn on "
+         "once charts are stable to grow the pattern-matcher history.")
 
 if st.sidebar.button("🔌 Connect broker"):
     with st.spinner("Logging in to Angel One..."):
@@ -103,21 +107,23 @@ except ImportError:
 
 
 # ── Cached data access ──────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_today_candles(name: str, tf: str) -> pd.DataFrame:
-    """Live candles for the latest trading day only (one retry)."""
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_today_candles(name: str, tf: str) -> tuple[pd.DataFrame, str]:
+    """Live candles for the latest trading day. Returns (df, reason)."""
     if not broker.is_connected and not broker.login():
-        return pd.DataFrame()
-    for attempt in range(2):
+        return pd.DataFrame(), "broker not connected"
+    reason = "API returned no data"
+    for attempt in range(3):
         try:
             df = broker.get_candles(name, tf, days=4)
             if not df.empty:
-                last_day = df.index[-1].date()      # most recent trading day
-                return df[df.index.date == last_day]
-        except Exception:
-            pass
-        time.sleep(0.4)
-    return pd.DataFrame()
+                last_day = df.index[-1].date()
+                return df[df.index.date == last_day], "live"
+            reason = "candle API returned empty (off-hours or rate-limited)"
+        except Exception as exc:  # capture the real cause for display
+            reason = f"{type(exc).__name__}: {str(exc)[:140]}"
+        time.sleep(0.6 * (attempt + 1))
+    return pd.DataFrame(), reason
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -426,7 +432,7 @@ def _resample(df5: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
     """Current-day candles, live first then the local cache (same day)."""
-    df = fetch_today_candles(name, tf)
+    df, reason = fetch_today_candles(name, tf)
     if not df.empty:
         if tf == "5min":          # persist live 5-min candles for resilience
             try:
@@ -442,7 +448,7 @@ def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
         day_df = hist[hist.index.date == last_day]
         if not day_df.empty:
             return _resample(day_df, tf), "cache"
-    return pd.DataFrame(), "none"
+    return pd.DataFrame(), reason
 
 
 def render_oi_table(name: str, chain: pd.DataFrame, spot: float) -> None:
@@ -582,14 +588,19 @@ def render_instrument(name: str, tf: str) -> None:
 
     if df.empty:
         # show spot/expiry from the chain so the tab still has a header
-        s1, s2, s3 = st.columns(3)
+        s1, s2, s3 = st.columns([1, 1, 1])
         s1.metric(f"{name} spot", f"{chain_spot:,.1f}" if chain_spot else "—")
         s2.metric("Current expiry", expiry or "—")
-        s3.metric("Chart", "loading…")
+        if s3.button("🔄 Reload chart", key=f"reload_{name}"):
+            fetch_today_candles.clear()
+            st.rerun()
         if broker.is_connected:
-            st.warning(f"⏳ {name} chart is loading — the 5-min history cache "
-                       "fills one instrument every ~30 s (and the candle API "
-                       "is quiet off-hours). OI analysis below already works.")
+            st.warning(f"⏳ **{name} candle chart unavailable.** Reason from "
+                       f"the broker API: **{source}**")
+            st.caption("If this says 'rate-limited', it clears on the next "
+                       "refresh. The candle (historical) API has a stricter "
+                       "limit than LTP/option-chain, which is why OI below "
+                       "works while the chart waits. Press Reload to retry.")
         else:
             st.error(f"❌ No {name} data — connect the broker from the "
                      "sidebar (credentials in Streamlit secrets / .env).")
@@ -788,9 +799,11 @@ with tabs[-1]:
     except Exception as exc:
         st.error(f"⚠️ Paper Trades render error: {exc}")
 
-# Build the multi-day history cache AFTER charts render, so live candle
-# fetches get API priority. Throttled: one instrument per ~30 s.
-grow_history_cache()
+# Multi-day history backfill (for the pattern matcher) is opt-in so it
+# never competes with live chart fetches on the strict historical-API
+# limit. Enable it from the sidebar once charts are stable.
+if st.session_state.get("enable_backfill"):
+    grow_history_cache()
 
 st.caption("⚠️ Educational tool. Options trading carries substantial risk of "
            "loss. Signals are probabilistic, not financial advice.")
