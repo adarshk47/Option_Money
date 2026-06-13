@@ -583,7 +583,7 @@ def render_instrument(name: str, tf: str) -> None:
         s1.metric(f"{name} spot", f"{chain_spot:,.1f}" if chain_spot else "—")
         s2.metric("Current expiry", expiry or "—")
         if s3.button("🔄 Reload chart", key=f"reload_{name}"):
-            fetch_today_candles.clear()
+            _fetch_candles_cached.clear()
             st.rerun()
         if broker.is_connected:
             st.warning(f"⏳ **{name} candle chart unavailable.** Reason from "
