@@ -50,21 +50,28 @@ def _save(name: str, df: pd.DataFrame) -> None:
 
 
 def get_history(name: str, years: int = TARGET_YEARS,
-                backfill_chunks: int = 2) -> pd.DataFrame:
-    """Cached 5-min history, extended forward + backfilled gradually."""
+                backfill_chunks: int = 1) -> pd.DataFrame:
+    """Cached 5-min history, extended forward + backfilled gradually.
+
+    Forward data is saved BEFORE any backfill is attempted, so a flaky
+    backfill never costs us the candles we already fetched.
+    """
     from backend.broker.angel_one import broker
 
     df = load_cached(name)
     if not broker.is_connected:
         return df
 
-    changed = False
-    # 1. extend forward with the latest week
+    # 1. extend forward with the latest week, and persist immediately
     try:
         recent = broker.get_candles(name, "5min", days=7)
         if not recent.empty:
             df = pd.concat([df, recent])
-            changed = True
+            df = df[~df.index.duplicated(keep="last")].sort_index()
+            try:
+                _save(name, df)
+            except Exception:
+                log.warning("History save failed for %s (read-only FS?)", name)
     except Exception:
         log.warning("History forward-fetch failed for %s", name)
 
@@ -83,15 +90,17 @@ def get_history(name: str, years: int = TARGET_YEARS,
             log.warning("History backfill failed for %s (%s → %s)",
                         name, from_dt.date(), to_dt.date())
             break
-        if chunk.empty:        # broker has no older data — stop trying
+        if chunk.empty:
             break
         df = pd.concat([chunk, df])
-        changed = True
-        time.sleep(0.4)        # stay inside API rate limits
-
-    if changed and not df.empty:
         df = df[~df.index.duplicated(keep="last")].sort_index()
-        _save(name, df)
+        try:
+            _save(name, df)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+    if not df.empty:
         log.info("History cache for %s: %d rows (%s → %s)", name, len(df),
                  df.index.min().date(), df.index.max().date())
     return df

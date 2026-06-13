@@ -127,13 +127,35 @@ def fetch_global():
     return global_quotes()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_history_long(name: str) -> pd.DataFrame:
-    """Multi-year 5-min history (cache file backfills 2 chunks per call)."""
+@st.cache_data(ttl=60, show_spinner=False)
+def load_history_file(name: str) -> pd.DataFrame:
+    """Read the local 5-min history cache file (no API calls)."""
     try:
-        return get_history(name, years=5, backfill_chunks=2)
+        return load_cached(name)
     except Exception:
         return pd.DataFrame()
+
+
+def grow_history_cache() -> None:
+    """Extend/backfill the history cache for ONE instrument per ~30 s.
+
+    Cycling one instrument at a time keeps the per-render API load low so
+    live candle fetches for the other tabs aren't rate-limited.
+    """
+    if not broker.is_connected:
+        return
+    now = time.time()
+    if now - st.session_state.get("hist_grow_ts", 0) < 30:
+        return
+    idx = st.session_state.get("hist_grow_idx", 0)
+    name = settings.watchlist[idx % len(settings.watchlist)]
+    try:
+        get_history(name, years=5, backfill_chunks=1)
+    except Exception:
+        pass
+    st.session_state["hist_grow_idx"] = idx + 1
+    st.session_state["hist_grow_ts"] = now
+    load_history_file.clear()
 
 
 def _parse_expiry(s: str):
@@ -347,10 +369,11 @@ def render_oi_flow(name: str, chain: pd.DataFrame, spot: float,
 # ── Pattern matcher panel ───────────────────────────────────────────
 def render_pattern_match(name: str, expiry: str) -> None:
     st.subheader("🔮 History pattern match (analog days)")
-    hist = fetch_history_long(name)
+    hist = load_history_file(name)
     if hist.empty:
-        st.info("Needs the broker connected — history cache builds "
-                "automatically once connected (target ~5 years of 5-min data).")
+        st.info("Building the history cache… connect the broker and keep the "
+                "app running — it backfills one instrument every ~30 s toward "
+                "~5 years of 5-min data, then matches today against past days.")
         return
 
     days = coverage_days(hist)
@@ -405,9 +428,7 @@ def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
             except Exception:
                 pass
         return df, "live"
-    hist = fetch_history_long(name)
-    if hist.empty:
-        hist = load_cached(name)
+    hist = load_history_file(name)
     if hist.empty:
         return pd.DataFrame(), "none"
     return _resample(hist, tf).tail(400), "cache"
@@ -549,10 +570,15 @@ def render_instrument(name: str, tf: str) -> None:
     chain, chain_spot, expiry = fetch_chain(name)
 
     if df.empty:
+        # show spot/expiry from the chain so the tab still has a header
+        s1, s2, s3 = st.columns(3)
+        s1.metric(f"{name} spot", f"{chain_spot:,.1f}" if chain_spot else "—")
+        s2.metric("Current expiry", expiry or "—")
+        s3.metric("Chart", "loading…")
         if broker.is_connected:
-            st.warning(f"⚠️ {name} candle API not responding (rate limit / "
-                       "off-hours) — retrying every refresh. OI analysis "
-                       "below still works.")
+            st.warning(f"⏳ {name} chart is loading — the 5-min history cache "
+                       "fills one instrument every ~30 s (and the candle API "
+                       "is quiet off-hours). OI analysis below already works.")
         else:
             st.error(f"❌ No {name} data — connect the broker from the "
                      "sidebar (credentials in Streamlit secrets / .env).")
@@ -738,6 +764,8 @@ def render_paper_tab() -> None:
 # ── Page ────────────────────────────────────────────────────────────
 render_header()
 st.divider()
+
+grow_history_cache()   # throttled: builds the 5-min cache one instrument/30s
 
 tab_labels = [f"📊 {n}" for n in settings.watchlist] + ["💰 Paper Trades"]
 tabs = st.tabs(tab_labels)
