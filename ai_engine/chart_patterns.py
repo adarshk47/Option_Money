@@ -109,6 +109,51 @@ def detect_chart_pattern(df: pd.DataFrame, lookback: int = 70) -> dict:
                         f"Three troughs with a lower head {lb:,.0f}; "
                         f"neckline {neck:,.0f}."))
 
+    # ── Triple Bottom (stronger than W) ───────────────────────────
+    if len(pl) >= 3:
+        (i1, l1), (i2, l2), (i3, l3) = pl[-3], pl[-2], pl[-1]
+        if i3 - i1 >= 6 and max(l1, l2, l3) <= low_zone:
+            avg3 = (l1 + l2 + l3) / 3
+            if avg3 and max(abs(l1 - avg3), abs(l2 - avg3), abs(l3 - avg3)) / avg3 < 0.015:
+                neck = float(highs[i1:i3 + 1].max())
+                status = "confirmed" if close > neck else "forming"
+                conf = 88 if status == "confirmed" else 68
+                out.append(("Triple Bottom", "bullish", conf, status,
+                            f"Three equal lows ~{avg3:,.0f}; "
+                            f"neckline {neck:,.0f} — very strong reversal base."))
+
+    # ── Triple Top (stronger than M) ──────────────────────────────
+    if len(ph) >= 3:
+        (i1, h1), (i2, h2), (i3, h3) = ph[-3], ph[-2], ph[-1]
+        if i3 - i1 >= 6 and min(h1, h2, h3) >= high_zone:
+            avg3 = (h1 + h2 + h3) / 3
+            if avg3 and max(abs(h1 - avg3), abs(h2 - avg3), abs(h3 - avg3)) / avg3 < 0.015:
+                neck = float(lows[i1:i3 + 1].min())
+                status = "confirmed" if close < neck else "forming"
+                conf = 88 if status == "confirmed" else 68
+                out.append(("Triple Top", "bearish", conf, status,
+                            f"Three equal highs ~{avg3:,.0f}; "
+                            f"neckline {neck:,.0f} — very strong reversal ceiling."))
+
+    # ── Bullish / Bearish Flag (momentum continuation) ─────────────
+    n = len(closes)
+    if n >= 30:
+        mid = n * 2 // 3           # pole = first 2/3, flag = last 1/3
+        pole_lo, pole_hi = closes[:mid].min(), closes[:mid].max()
+        flag_lo, flag_hi = closes[mid:].min(), closes[mid:].max()
+        pole_range = (pole_hi - pole_lo) / (pole_lo or 1)
+        flag_range = (flag_hi - flag_lo) / (flag_lo or 1)
+        if pole_range > 0.012 and flag_range < pole_range * 0.45:
+            pole_up = closes[mid - 1] > closes[0]
+            if pole_up:
+                out.append(("Bullish Flag", "bullish", 62, "forming",
+                            f"Sharp {pole_range*100:.1f}% pole then tight "
+                            f"{flag_range*100:.1f}% flag — continuation breakout expected."))
+            else:
+                out.append(("Bearish Flag", "bearish", 62, "forming",
+                            f"Sharp {pole_range*100:.1f}% pole (down) then tight "
+                            f"{flag_range*100:.1f}% flag — continuation breakdown expected."))
+
     # ── Triangles / channels from pivot slopes ─────────────────────
     if len(ph) >= 2 and len(pl) >= 2:
         hx = np.array([p[0] for p in ph[-3:]], float)

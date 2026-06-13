@@ -40,6 +40,10 @@ _INTERVAL_MAP = {
     "1day": "ONE_DAY",
 }
 
+# Angel One caps getCandleData to ~1 request/second per API key.
+# Enforce a minimum gap so NIFTY/SENSEX/SBIN fetches never race each other.
+_CANDLE_GAP_S = 1.5
+
 
 def _retry(max_attempts: int = 4, base_delay: float = 1.0):
     """Retry decorator with exponential backoff for flaky API calls."""
@@ -67,6 +71,7 @@ class AngelOneClient:
 
     _instance: Optional["AngelOneClient"] = None
     _lock = threading.Lock()
+    _last_candle_ts: float = 0.0   # shared rate-limit guard across all instruments
 
     def __new__(cls) -> "AngelOneClient":
         with cls._lock:
@@ -146,6 +151,23 @@ class AngelOneClient:
 
     # ── Market data ────────────────────────────────────────────────
 
+    def _candle_request(self, params: dict) -> dict:
+        """Call getCandleData with a rate-limit gap; raises on API-level errors."""
+        with self._api_lock:
+            gap = _CANDLE_GAP_S - (time.time() - AngelOneClient._last_candle_ts)
+            if gap > 0:
+                time.sleep(gap)
+            data = self.api.getCandleData(params)
+            AngelOneClient._last_candle_ts = time.time()
+        if not data:
+            raise RuntimeError("getCandleData returned None — check connectivity")
+        if not data.get("status"):
+            raise RuntimeError(
+                f"getCandleData error: {data.get('message', 'unknown')} "
+                f"(code {data.get('errorcode', '?')})"
+            )
+        return data
+
     @_retry()
     def get_ltp(self, name: str) -> Optional[float]:
         """Last traded price for a watchlist instrument."""
@@ -157,12 +179,13 @@ class AngelOneClient:
             return float(data["data"]["ltp"])
         return None
 
-    @_retry()
+    @_retry(max_attempts=2, base_delay=2.0)
     def get_candles(self, name: str, interval: str = "5min",
                     days: int = 5) -> pd.DataFrame:
         """
         Historical OHLCV candles as a DataFrame indexed by timestamp.
         20min candles are resampled from 5min data.
+        Raises RuntimeError on API errors so callers know to retry later.
         """
         self.ensure_session()
         meta = INSTRUMENTS[name]
@@ -176,10 +199,9 @@ class AngelOneClient:
             "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        with self._api_lock:
-            data = self.api.getCandleData(params)
-        if not data or not data.get("data"):
-            return pd.DataFrame()
+        data = self._candle_request(params)   # raises on error
+        if not data.get("data"):
+            return pd.DataFrame()             # market closed / holiday — not an error
         df = pd.DataFrame(
             data["data"],
             columns=["timestamp", "open", "high", "low", "close", "volume"],
@@ -195,7 +217,7 @@ class AngelOneClient:
             )
         return df
 
-    @_retry()
+    @_retry(max_attempts=2, base_delay=2.0)
     def get_candles_range(self, name: str, interval: str,
                           from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
         """Historical candles for an explicit date range (for backfills)."""
@@ -208,9 +230,8 @@ class AngelOneClient:
             "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        with self._api_lock:
-            data = self.api.getCandleData(params)
-        if not data or not data.get("data"):
+        data = self._candle_request(params)   # raises on error
+        if not data.get("data"):
             return pd.DataFrame()
         df = pd.DataFrame(
             data["data"],

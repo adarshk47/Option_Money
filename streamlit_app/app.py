@@ -108,22 +108,29 @@ except ImportError:
 
 # ── Cached data access ──────────────────────────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
+def _fetch_candles_cached(name: str, tf: str) -> pd.DataFrame:
+    """Successful candle fetches are cached 60 s.
+    Raises on broker errors so @st.cache_data does NOT cache failures —
+    the next render (3 s later) retries automatically."""
+    if not broker.is_connected:
+        if not broker.login():
+            raise ConnectionError("broker not connected — check credentials")
+    # broker.get_candles raises RuntimeError on API-level errors (rate limit,
+    # auth failure, etc.) and returns empty df for market-closed / holiday.
+    df = broker.get_candles(name, tf, days=4)
+    if df.empty:
+        return pd.DataFrame()
+    last_day = df.index[-1].date()
+    return df[df.index.date == last_day]
+
+
 def fetch_today_candles(name: str, tf: str) -> tuple[pd.DataFrame, str]:
-    """Live candles for the latest trading day. Returns (df, reason)."""
-    if not broker.is_connected and not broker.login():
-        return pd.DataFrame(), "broker not connected"
-    reason = "API returned no data"
-    for attempt in range(3):
-        try:
-            df = broker.get_candles(name, tf, days=4)
-            if not df.empty:
-                last_day = df.index[-1].date()
-                return df[df.index.date == last_day], "live"
-            reason = "candle API returned empty (off-hours or rate-limited)"
-        except Exception as exc:  # capture the real cause for display
-            reason = f"{type(exc).__name__}: {str(exc)[:140]}"
-        time.sleep(0.6 * (attempt + 1))
-    return pd.DataFrame(), reason
+    """Returns (df, reason). Failures not cached so the next refresh retries."""
+    try:
+        df = _fetch_candles_cached(name, tf)
+        return df, "live" if not df.empty else "market closed / no data this day"
+    except Exception as exc:
+        return pd.DataFrame(), f"{type(exc).__name__}: {str(exc)[:140]}"
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -481,34 +488,18 @@ def render_oi_table(name: str, chain: pd.DataFrame, spot: float) -> None:
 
 def render_chain_panels(name: str, chain: pd.DataFrame,
                         chain_spot: float) -> None:
-    left, right = st.columns([1, 1])
-    with left:
-        st.subheader("🔗 Option chain analysis")
-        oc = analyse_option_chain(chain, chain_spot)
-        if oc.get("available"):
-            a, b, c = st.columns(3)
-            a.metric("PCR", oc["pcr"])
-            b.metric("Max pain", f"{oc['max_pain']:,.0f}")
-            c.metric("Dominance", oc["dominance"])
-            st.caption(f"OI support **{oc['oi_support']:,.0f}** · "
-                       f"OI resistance **{oc['oi_resistance']:,.0f}** · "
-                       f"{oc['oi_buildup']['pe_view']}")
-        else:
-            st.info("Option chain analytics unavailable right now.")
-    with right:
-        st.subheader("🔥 OI heatmap (near ATM)")
-        if not chain.empty and chain_spot:
-            near = chain[(chain["strike"] - chain_spot).abs()
-                         <= chain_spot * 0.03]
-            heat = go.Figure()
-            heat.add_trace(go.Bar(x=near["strike"], y=near["ce_oi"],
-                                  name="CE OI", marker_color="crimson"))
-            heat.add_trace(go.Bar(x=near["strike"], y=-near["pe_oi"],
-                                  name="PE OI", marker_color="seagreen"))
-            heat.add_vline(x=chain_spot, line_dash="dash")
-            heat.update_layout(barmode="relative", height=300,
-                               margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(heat, use_container_width=True, key=f"heat_{name}")
+    st.subheader("🔗 Option chain analysis")
+    oc = analyse_option_chain(chain, chain_spot)
+    if oc.get("available"):
+        a, b, c = st.columns(3)
+        a.metric("PCR", oc["pcr"])
+        b.metric("Max pain", f"{oc['max_pain']:,.0f}")
+        c.metric("Dominance", oc["dominance"])
+        st.caption(f"OI support **{oc['oi_support']:,.0f}** · "
+                   f"OI resistance **{oc['oi_resistance']:,.0f}** · "
+                   f"{oc['oi_buildup']['pe_view']}")
+    else:
+        st.info("Option chain analytics unavailable right now.")
 
 
 def _save_dashboard_signal(name: str, tf: str, rec) -> None:
