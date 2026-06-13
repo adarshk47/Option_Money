@@ -54,7 +54,7 @@ from backend.broker.angel_one import broker
 from backend.broker.paper_broker import paper_broker
 from backend.config import settings
 from backend.data.global_markets import MARKET_GROUP, global_quotes
-from backend.data.history_store import coverage_days, get_history
+from backend.data.history_store import coverage_days, get_history, load_cached
 from backend.data.option_chain import option_chain_fetcher
 from database.db import db
 from engine.trade_manager import trade_manager
@@ -347,6 +347,89 @@ def render_pattern_match(name: str, expiry: str) -> None:
 
 
 # ── Per-instrument tab ──────────────────────────────────────────────
+def _resample(df5: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """Resample cached 5-min candles to the selected timeframe."""
+    if tf in ("1min", "5min") or df5.empty:
+        return df5
+    return (df5.resample(tf)
+            .agg({"open": "first", "high": "max", "low": "min",
+                  "close": "last", "volume": "sum"})
+            .dropna())
+
+
+def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
+    """Live candles first; fall back to the local history cache file."""
+    df = fetch_candles(name, tf)
+    if not df.empty:
+        return df, "live"
+    hist = fetch_history_long(name)
+    if hist.empty:
+        hist = load_cached(name)
+    if hist.empty:
+        return pd.DataFrame(), "none"
+    return _resample(hist, tf).tail(400), "cache"
+
+
+def render_oi_table(name: str, chain: pd.DataFrame, spot: float) -> None:
+    """ATM ±5 strikes OI table — always available when a chain exists."""
+    st.subheader("🎯 Option chain — ATM ±5 strikes")
+    if chain.empty or not spot:
+        st.info("Chain data unavailable — connect the broker (sidebar).")
+        return
+    pos = chain.index.get_loc((chain["strike"] - spot).abs().idxmin())
+    atm = float(chain.iloc[pos]["strike"])
+    sub = chain.iloc[max(0, pos - 5):pos + 6][
+        ["ce_oi", "ce_chg_oi", "ce_ltp", "strike",
+         "pe_ltp", "pe_chg_oi", "pe_oi"]].copy()
+    ce_sum, pe_sum = sub["ce_oi"].sum(), sub["pe_oi"].sum()
+    for c in ("ce_oi", "ce_chg_oi", "pe_chg_oi", "pe_oi"):
+        sub[c] = sub[c].map(lambda v: f"{v:+,.0f}" if "chg" in c
+                            else f"{v:,.0f}")
+    sub["strike"] = sub["strike"].map(
+        lambda s: f"⭐ {s:,.0f}" if s == atm else f"{s:,.0f}")
+    sub.columns = ["CE OI", "CE ΔOI", "CE LTP", "Strike",
+                   "PE LTP", "PE ΔOI", "PE OI"]
+    st.dataframe(sub, use_container_width=True, hide_index=True)
+    side = ("CALL side heavier → resistance above (bearish lean)"
+            if ce_sum > pe_sum * 1.1
+            else "PUT side heavier → support below (bullish lean)"
+            if pe_sum > ce_sum * 1.1 else "balanced")
+    st.caption(f"±5 strikes total — CE OI **{ce_sum:,.0f}** vs PE OI "
+               f"**{pe_sum:,.0f}** → {side}")
+
+
+def render_chain_panels(name: str, chain: pd.DataFrame,
+                        chain_spot: float) -> None:
+    left, right = st.columns([1, 1])
+    with left:
+        st.subheader("🔗 Option chain analysis")
+        oc = analyse_option_chain(chain, chain_spot)
+        if oc.get("available"):
+            a, b, c = st.columns(3)
+            a.metric("PCR", oc["pcr"])
+            b.metric("Max pain", f"{oc['max_pain']:,.0f}")
+            c.metric("Dominance", oc["dominance"])
+            st.caption(f"OI support **{oc['oi_support']:,.0f}** · "
+                       f"OI resistance **{oc['oi_resistance']:,.0f}** · "
+                       f"{oc['oi_buildup']['pe_view']}")
+        else:
+            st.info("Option chain analytics unavailable right now.")
+    with right:
+        st.subheader("🔥 OI heatmap (near ATM)")
+        if not chain.empty and chain_spot:
+            near = chain[(chain["strike"] - chain_spot).abs()
+                         <= chain_spot * 0.03]
+            heat = go.Figure()
+            heat.add_trace(go.Bar(x=near["strike"], y=near["ce_oi"],
+                                  name="CE OI", marker_color="crimson"))
+            heat.add_trace(go.Bar(x=near["strike"], y=-near["pe_oi"],
+                                  name="PE OI", marker_color="seagreen"))
+            heat.add_vline(x=chain_spot, line_dash="dash")
+            heat.update_layout(barmode="relative", height=300,
+                               margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(heat, use_container_width=True, key=f"heat_{name}")
+
+
 def _save_dashboard_signal(name: str, tf: str, rec) -> None:
     if not rec.option_type or rec.confidence < 60:
         return
@@ -377,16 +460,28 @@ def _signal_pins(name: str, dfi: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_instrument(name: str, tf: str) -> None:
-    df = fetch_candles(name, tf)
+    df, source = get_chart_df(name, tf)
     chain, chain_spot, expiry = fetch_chain(name)
 
     if df.empty:
-        st.error(f"❌ No {name} candle data. Connect the broker from the "
-                 "sidebar (Angel One credentials in Streamlit secrets / .env). "
-                 "Retries automatically every refresh.")
-        # still show whatever option-chain data we have
+        if broker.is_connected:
+            st.warning(f"⚠️ {name} candle API not responding (rate limit / "
+                       "off-hours) — retrying every refresh. OI analysis "
+                       "below still works.")
+        else:
+            st.error(f"❌ No {name} data — connect the broker from the "
+                     "sidebar (credentials in Streamlit secrets / .env).")
+        # candles missing — but render every chain-based analysis anyway
+        render_oi_table(name, chain, chain_spot)
         render_oi_flow(name, chain, chain_spot, expiry)
+        render_chain_panels(name, chain, chain_spot)
+        render_pattern_match(name, expiry)
         return
+
+    if source == "cache":
+        st.info(f"📁 Live candle API unavailable — chart from the local "
+                f"history cache (last candle {df.index.max():%d %b %H:%M}). "
+                "Switches back to live automatically.")
 
     dfi = add_all_indicators(df)
     rec = recommendation_engine.analyse(name, df, tf, option_chain=chain,
@@ -502,37 +597,9 @@ def render_instrument(name: str, tf: str) -> None:
         for r in rec.reasoning:
             st.write("•", r)
 
+    render_oi_table(name, chain, chain_spot)
     render_oi_flow(name, chain, chain_spot, expiry)
-
-    left, right = st.columns([1, 1])
-    with left:
-        st.subheader("🔗 Option chain analysis")
-        oc = analyse_option_chain(chain, chain_spot)
-        if oc.get("available"):
-            a, b, c = st.columns(3)
-            a.metric("PCR", oc["pcr"])
-            b.metric("Max pain", f"{oc['max_pain']:,.0f}")
-            c.metric("Dominance", oc["dominance"])
-            st.caption(f"OI support **{oc['oi_support']:,.0f}** · "
-                       f"OI resistance **{oc['oi_resistance']:,.0f}** · "
-                       f"{oc['oi_buildup']['pe_view']}")
-        else:
-            st.info("Option chain analytics unavailable right now.")
-    with right:
-        st.subheader("🔥 OI heatmap (near ATM)")
-        if not chain.empty and chain_spot:
-            near = chain[(chain["strike"] - chain_spot).abs()
-                         <= chain_spot * 0.03]
-            heat = go.Figure()
-            heat.add_trace(go.Bar(x=near["strike"], y=near["ce_oi"],
-                                  name="CE OI", marker_color="crimson"))
-            heat.add_trace(go.Bar(x=near["strike"], y=-near["pe_oi"],
-                                  name="PE OI", marker_color="seagreen"))
-            heat.add_vline(x=chain_spot, line_dash="dash")
-            heat.update_layout(barmode="relative", height=300,
-                               margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(heat, use_container_width=True, key=f"heat_{name}")
-
+    render_chain_panels(name, chain, chain_spot)
     render_pattern_match(name, expiry)
 
 
