@@ -117,7 +117,7 @@ def _fetch_candles_cached(name: str, tf: str) -> pd.DataFrame:
             raise ConnectionError("broker not connected — check credentials")
     # broker.get_candles raises RuntimeError on API-level errors (rate limit,
     # auth failure, etc.) and returns empty df for market-closed / holiday.
-    df = broker.get_candles(name, tf, days=4)
+    df = broker.get_candles(name, tf, days=7)
     if df.empty:
         return pd.DataFrame()
     last_day = df.index[-1].date()

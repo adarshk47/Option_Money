@@ -191,6 +191,13 @@ class AngelOneClient:
         meta = INSTRUMENTS[name]
         fetch_interval = "5min" if interval == "20min" else interval
         to_dt = datetime.now()
+        # Angel One returns empty data when todate falls on a weekend —
+        # roll back to the most recent weekday (Friday).
+        wd = to_dt.weekday()
+        if wd == 5:    # Saturday → Friday
+            to_dt -= timedelta(days=1)
+        elif wd == 6:  # Sunday → Friday
+            to_dt -= timedelta(days=2)
         from_dt = to_dt - timedelta(days=days)
         params = {
             "exchange": meta["exchange"],
