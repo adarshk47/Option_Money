@@ -46,6 +46,7 @@ import plotly.graph_objects as go
 import pytz
 from plotly.subplots import make_subplots
 
+from ai_engine.chart_patterns import detect_chart_pattern
 from ai_engine.indicators import add_all_indicators
 from ai_engine.option_chain_analysis import analyse_option_chain
 from ai_engine.pattern_matcher import find_analog_days
@@ -60,7 +61,7 @@ from database.db import db
 from engine.trade_manager import trade_manager
 
 IST = pytz.timezone("Asia/Kolkata")
-OI_WINDOWS = [1, 2, 5, 10, 30, 60, 120, 240, 360]   # minutes
+OI_WINDOWS = [1, 2, 5, 10, 15, 30, 60]   # minutes (multi-window OI table)
 
 st.set_page_config(page_title="OptionMoney AI", page_icon="📈",
                    layout="wide", initial_sidebar_state="expanded")
@@ -68,6 +69,7 @@ st.set_page_config(page_title="OptionMoney AI", page_icon="📈",
 # one-time housekeeping per session
 if "oi_purged" not in st.session_state:
     db.purge_oi(keep_days=2)
+    db.purge_predictions(keep_days=2)
     st.session_state.oi_purged = True
 if broker.is_connected is False and "auto_login_tried" not in st.session_state:
     st.session_state.auto_login_tried = True
@@ -77,8 +79,6 @@ if broker.is_connected is False and "auto_login_tried" not in st.session_state:
 st.sidebar.title("⚙️ Controls")
 timeframe = st.sidebar.selectbox("Timeframe", settings.timeframes, index=1)
 refresh_s = st.sidebar.selectbox("Refresh rate (seconds)", [3, 5, 10, 30],
-                                 index=0)
-oi_window = st.sidebar.selectbox("OI change window (minutes)", OI_WINDOWS,
                                  index=0)
 mode_badge = "🟢 PAPER" if settings.is_paper else "🔴 LIVE"
 st.sidebar.markdown(f"**Mode:** {mode_badge}")
@@ -167,15 +167,21 @@ def render_header() -> None:
     quotes = fetch_global()
     now = datetime.now(IST)
     items = list(quotes.items())
-    for start in range(0, len(items), 6):       # rows of 6 tickers
-        cols = st.columns(6)
-        for col, (name, q) in zip(cols, items[start:start + 6]):
-            dot = "🟢" if _market_open(MARKET_GROUP.get(name, ""), now) else "🔴"
-            if q:
-                col.metric(f"{dot} {name}", f"{q['price']:,.0f}",
-                           f"{q['chg_pct']:+.2f}%")
-            else:
-                col.metric(f"{dot} {name}", "—")
+    cols = st.columns(len(items))               # all tickers on one line
+    for col, (name, q) in zip(cols, items):
+        dot = "🟢" if _market_open(MARKET_GROUP.get(name, ""), now) else "🔴"
+        if q:
+            arrow = "🔺" if q["chg_pct"] >= 0 else "🔻"
+            col.markdown(
+                f"<div style='font-size:11px;line-height:1.25'>"
+                f"{dot} <b>{name}</b><br>"
+                f"<span style='font-size:15px'>{q['price']:,.0f}</span><br>"
+                f"<span style='color:{'#1a9850' if q['chg_pct'] >= 0 else '#d73027'}'>"
+                f"{arrow} {q['chg_pct']:+.2f}%</span></div>",
+                unsafe_allow_html=True)
+        else:
+            col.markdown(f"<div style='font-size:11px'>{dot} <b>{name}</b><br>—"
+                         "</div>", unsafe_allow_html=True)
 
     wd, t = now.weekday(), now.time()
     if wd >= 5:
@@ -254,57 +260,88 @@ def _oi_trend(dce: float, dpe: float) -> tuple[str, str]:
 
 
 def render_oi_flow(name: str, chain: pd.DataFrame, spot: float,
-                   expiry: str) -> None:
-    st.subheader("📡 OI flow & market trend")
+                   expiry: str) -> str:
+    """Multi-window OI delta table + overall verdict. Returns the OI bias."""
+    st.subheader("📡 OI delta by window — trend direction")
     if chain.empty:
         st.info("Option chain unavailable — connect the broker (sidebar). "
                 "SENSEX/SBIN chains load from Angel One quotes once connected.")
-        return
+        return "—"
 
     market_open = _market_open("IN", datetime.now(IST))
     st.caption(f"Current expiry: **{expiry or '—'}** · spot {spot:,.1f}"
                + ("" if market_open
-                  else " · 🌙 market offline — showing **last available** data"))
+                  else " · 🌙 market offline — intraday windows fill in once "
+                       "live OI starts moving"))
 
     _store_oi_snapshot(name, chain, spot)
     since = (datetime.now() - timedelta(hours=30)).isoformat()
     rows = db.oi_history(name, since)
 
-    delta = _window_delta(rows, oi_window)
-    if delta:
+    # Build a row per window: ΔCE, ΔPE, net, trend
+    table, votes = [], []
+    for win in OI_WINDOWS:
+        delta = _window_delta(rows, win)
+        if delta is None:
+            table.append({"Window": f"{win} min", "CE ΔOI": "—",
+                          "PE ΔOI": "—", "Net (PE−CE)": "—",
+                          "Trend": "⏳ collecting"})
+            continue
         dce, dpe = delta
-        a, b, c = st.columns(3)
-        a.metric(f"CE OI Δ ({oi_window}m)", f"{dce:+,.0f}",
-                 help="Positive = call writing building (bearish pressure)")
-        b.metric(f"PE OI Δ ({oi_window}m)", f"{dpe:+,.0f}",
-                 help="Positive = put writing building (bullish support)")
         trend, dot = _oi_trend(dce, dpe)
-        c.metric("Net flow (PE−CE)", f"{(dpe - dce):+,.0f}")
-        st.markdown(f"### {dot} Current market trend (OI-based): **{trend}**")
-    else:
-        dce = float(chain["ce_chg_oi"].sum())
-        dpe = float(chain["pe_chg_oi"].sum())
-        a, b, c = st.columns(3)
-        a.metric("CE OI Δ (day)", f"{dce:+,.0f}")
-        b.metric("PE OI Δ (day)", f"{dpe:+,.0f}")
-        trend, dot = _oi_trend(dce, dpe)
-        c.metric("Net flow (PE−CE)", f"{(dpe - dce):+,.0f}")
-        st.markdown(f"### {dot} Last session's trend (day OI change): **{trend}**")
-        st.caption("Live windowed tracking builds up automatically — one "
-                   "snapshot per minute is saved to the database while the "
-                   "app runs (kept ~2 days).")
+        votes.append((win, trend))
+        table.append({
+            "Window": f"{win} min",
+            "CE ΔOI": f"{dce:+,.0f}",
+            "PE ΔOI": f"{dpe:+,.0f}",
+            "Net (PE−CE)": f"{(dpe - dce):+,.0f}",
+            "Trend": f"{dot} {trend.split(' — ')[0]}",
+        })
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
-    if rows:
+    # Day fallback row (always available from NSE change-in-OI)
+    day_dce = float(chain["ce_chg_oi"].sum())
+    day_dpe = float(chain["pe_chg_oi"].sum())
+    day_trend, day_dot = _oi_trend(day_dce, day_dpe)
+    st.caption(f"Whole-day OI change → CE {day_dce:+,.0f} · PE {day_dpe:+,.0f} "
+               f"→ {day_dot} {day_trend}")
+
+    # Overall verdict (weight longer windows more; fall back to day)
+    if votes:
+        score = 0.0
+        for win, trend in votes:
+            w = win        # longer window = more weight
+            if trend.startswith("BULLISH"):
+                score += w
+            elif trend.startswith("BEARISH"):
+                score -= w
+            elif trend.startswith("WIND-UP"):
+                score -= w * 0.3
+        bias = ("BULLISH" if score > 0 else "BEARISH" if score < 0 else "SIDEWAYS")
+        dot = "🟢" if score > 0 else "🔴" if score < 0 else "⚪"
+        bull_n = sum(1 for _, t in votes if t.startswith("BULLISH"))
+        bear_n = sum(1 for _, t in votes if t.startswith("BEARISH"))
+        st.markdown(f"### {dot} Overall OI trend: **{bias}** "
+                    f"({bull_n} bullish / {bear_n} bearish across "
+                    f"{len(votes)} windows)")
+    else:
+        bias = day_trend.split(" — ")[0]
+        st.markdown(f"### {day_dot} Overall (last-session OI): **{bias}**")
+        st.caption("Per-minute windows fill in automatically while the app "
+                   "runs during market hours (snapshots saved every minute).")
+
+    if rows and len(rows) >= 2:
         hist_df = pd.DataFrame(rows)
         hist_df["time"] = pd.to_datetime(hist_df["ts"]).dt.strftime("%H:%M")
         chart_df = hist_df.set_index("time")[["ce_oi", "pe_oi"]]
         chart_df.columns = ["CE total OI", "PE total OI"]
-        st.line_chart(chart_df, height=200)
+        st.line_chart(chart_df, height=180)
 
     if market_open and datetime.now(IST).time() >= dtime(14, 45):
         st.warning("⏰ **Closing hour:** writers typically square off now — "
                    "expect unwinding and fast premium decay. Prefer exits "
                    "over fresh option buying.")
+    return bias
 
 
 # ── Pattern matcher panel ───────────────────────────────────────────
@@ -361,6 +398,12 @@ def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
     """Live candles first; fall back to the local history cache file."""
     df = fetch_candles(name, tf)
     if not df.empty:
+        if tf == "5min":          # persist live 5-min candles for resilience
+            try:
+                from backend.data.history_store import merge_and_save
+                merge_and_save(name, df)
+            except Exception:
+                pass
         return df, "live"
     hist = fetch_history_long(name)
     if hist.empty:
@@ -446,6 +489,48 @@ def _save_dashboard_signal(name: str, tf: str, rec) -> None:
     st.session_state[key] = stamp
 
 
+def _save_prediction(name: str, tf: str, rec, pattern: dict,
+                     oi_bias: str) -> None:
+    """Persist a timestamped prediction snapshot (throttled, kept daily).
+
+    Saves when the action/pattern changes, or at most once every 3 min,
+    so the daily log captures every meaningful shift without flooding.
+    """
+    key = f"pred_{name}_{tf}"
+    last = st.session_state.get(key, {})
+    changed = (last.get("action") != rec.action
+               or last.get("pattern") != pattern["pattern"])
+    fresh = time.time() - last.get("ts", 0) > 180
+    if not (changed or fresh):
+        return
+    db.insert_prediction(
+        underlying=name, timeframe=tf, action=rec.action,
+        option_type=rec.option_type, confidence=rec.confidence, spot=rec.spot,
+        entry_price=rec.entry_price, stop_loss=rec.stop_loss,
+        target1=rec.target1, target2=rec.target2,
+        chart_pattern=pattern["pattern"], pattern_bias=pattern["bias"],
+        oi_bias=oi_bias, reasoning="; ".join(rec.reasoning[:4]),
+    )
+    st.session_state[key] = {"action": rec.action,
+                             "pattern": pattern["pattern"], "ts": time.time()}
+
+
+def render_predictions_log(name: str) -> None:
+    st.subheader("🗒️ Today's prediction history")
+    preds = db.todays_predictions(name, limit=60)
+    if not preds:
+        st.info("No predictions logged yet today — they accumulate as the "
+                "app runs (kept for the day).")
+        return
+    df = pd.DataFrame(preds)
+    df["time"] = pd.to_datetime(df["ts"]).dt.strftime("%H:%M:%S")
+    show = df[["time", "action", "confidence", "spot", "entry_price",
+               "stop_loss", "target1", "chart_pattern", "oi_bias"]].copy()
+    show.columns = ["Time", "Signal", "Conf%", "Spot", "Entry", "SL",
+                    "T1", "Chart pattern", "OI bias"]
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+
 def _signal_pins(name: str, dfi: pd.DataFrame) -> pd.DataFrame:
     sigs = pd.DataFrame(db.recent_signals(300))
     if sigs.empty:
@@ -476,6 +561,7 @@ def render_instrument(name: str, tf: str) -> None:
         render_oi_flow(name, chain, chain_spot, expiry)
         render_chain_panels(name, chain, chain_spot)
         render_pattern_match(name, expiry)
+        render_predictions_log(name)
         return
 
     if source == "cache":
@@ -486,7 +572,7 @@ def render_instrument(name: str, tf: str) -> None:
     dfi = add_all_indicators(df)
     rec = recommendation_engine.analyse(name, df, tf, option_chain=chain,
                                         chain_spot=chain_spot)
-    _save_dashboard_signal(name, tf, rec)
+    pattern = detect_chart_pattern(df)
     last_close = float(dfi["close"].iloc[-1])
 
     # ── Metrics + ONE-LINE prediction ──────────────────────────────
@@ -497,6 +583,7 @@ def render_instrument(name: str, tf: str) -> None:
     c4.metric("Risk level", rec.risk_level)
     c5.metric("Current expiry", expiry or "—")
 
+    now_str = datetime.now(IST).strftime("%H:%M:%S")
     emoji = ("🟢" if rec.option_type == "CE"
              else "🔴" if rec.option_type == "PE" else "⚪")
     if rec.option_type:
@@ -504,10 +591,18 @@ def render_instrument(name: str, tf: str) -> None:
             f"### {emoji} **{rec.action}** · Entry(spot) **{rec.entry_price}** "
             f"| SL **{rec.stop_loss}** | T1 **{rec.target1}** "
             f"| T2 **{rec.target2}** · Confidence **{rec.confidence}%** "
-            f"· [{tf}]")
+            f"· [{tf}] · 🕒 {now_str}")
     else:
         top_reason = rec.reasoning[0] if rec.reasoning else ""
-        st.markdown(f"### {emoji} **{rec.action}** — {top_reason} · [{tf}]")
+        st.markdown(f"### {emoji} **{rec.action}** — {top_reason} "
+                    f"· [{tf}] · 🕒 {now_str}")
+
+    # ── Chart pattern line (W / M / H&S / triangle …) ──────────────
+    p_emoji = ("🟢" if pattern["bias"] == "bullish"
+               else "🔴" if pattern["bias"] == "bearish" else "🔵")
+    st.markdown(f"{p_emoji} **📐 Chart pattern:** {pattern['pattern']} "
+                f"({pattern['status']}) — {pattern['bias']} · "
+                f"{pattern['description']}")
 
     # ── Chart: hover price, current-price line, signal pins ────────
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
@@ -598,9 +693,14 @@ def render_instrument(name: str, tf: str) -> None:
             st.write("•", r)
 
     render_oi_table(name, chain, chain_spot)
-    render_oi_flow(name, chain, chain_spot, expiry)
+    oi_bias = render_oi_flow(name, chain, chain_spot, expiry)
     render_chain_panels(name, chain, chain_spot)
     render_pattern_match(name, expiry)
+
+    # store this prediction (with pattern + OI bias) — throttled, daily
+    _save_dashboard_signal(name, tf, rec)
+    _save_prediction(name, tf, rec, pattern, oi_bias)
+    render_predictions_log(name)
 
 
 # ── Paper trades tab ────────────────────────────────────────────────

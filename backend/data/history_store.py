@@ -97,6 +97,15 @@ def get_history(name: str, years: int = TARGET_YEARS,
     return df
 
 
+def merge_and_save(name: str, fresh: pd.DataFrame) -> None:
+    """Persist freshly-fetched live 5-min candles into the cache file."""
+    if fresh is None or fresh.empty:
+        return
+    df = pd.concat([load_cached(name), fresh])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    _save(name, df)
+
+
 def coverage_days(df: pd.DataFrame) -> int:
     if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return 0

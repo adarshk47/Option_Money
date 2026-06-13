@@ -85,9 +85,29 @@ CREATE TABLE IF NOT EXISTS oi_history (
     spot REAL
 );
 
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    underlying TEXT NOT NULL,
+    timeframe TEXT,
+    action TEXT,
+    option_type TEXT,
+    confidence REAL,
+    spot REAL,
+    entry_price REAL,
+    stop_loss REAL,
+    target1 REAL,
+    target2 REAL,
+    chart_pattern TEXT,
+    pattern_bias TEXT,
+    oi_bias TEXT,
+    reasoning TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_oi_hist ON oi_history(underlying, ts);
+CREATE INDEX IF NOT EXISTS idx_pred ON predictions(underlying, ts);
 """
 
 
@@ -196,6 +216,37 @@ class Database:
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
         with self._conn() as conn:
             conn.execute("DELETE FROM oi_history WHERE ts < ?", (cutoff,))
+
+    # ── Predictions (timestamped, kept ~2 days) ────────────────────
+
+    def insert_prediction(self, **kw: Any) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO predictions
+                   (ts, underlying, timeframe, action, option_type, confidence,
+                    spot, entry_price, stop_loss, target1, target2,
+                    chart_pattern, pattern_bias, oi_bias, reasoning)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(), kw["underlying"], kw.get("timeframe"),
+                 kw.get("action"), kw.get("option_type"), kw.get("confidence"),
+                 kw.get("spot"), kw.get("entry_price"), kw.get("stop_loss"),
+                 kw.get("target1"), kw.get("target2"), kw.get("chart_pattern"),
+                 kw.get("pattern_bias"), kw.get("oi_bias"), kw.get("reasoning")),
+            )
+
+    def todays_predictions(self, underlying: str, limit: int = 60) -> list[dict]:
+        today = datetime.now().date().isoformat()
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM predictions WHERE underlying=? AND ts>=? "
+                "ORDER BY id DESC LIMIT ?", (underlying, today, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def purge_predictions(self, keep_days: int = 2) -> None:
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM predictions WHERE ts < ?", (cutoff,))
 
     # ── Backtests / settings ───────────────────────────────────────
 
