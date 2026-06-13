@@ -40,6 +40,7 @@ def detect_chart_pattern(df: pd.DataFrame, lookback: int = 70) -> dict:
     w = df.tail(lookback).reset_index(drop=True)
     highs = w["high"].to_numpy(float)
     lows = w["low"].to_numpy(float)
+    closes = w["close"].to_numpy(float)
     close = float(w["close"].iloc[-1])
     ph = _pivots(highs, kind="high")
     pl = _pivots(lows, kind="low")
@@ -180,7 +181,6 @@ def detect_chart_pattern(df: pd.DataFrame, lookback: int = 70) -> dict:
                         "Lower highs and lower lows — trend down."))
 
     # ── Trend fallback via close regression (R²-weighted) ──────────
-    closes = w["close"].to_numpy(float)
     x = np.arange(len(closes), dtype=float)
     slope, intercept = np.polyfit(x, closes, 1)
     fitted = slope * x + intercept
