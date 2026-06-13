@@ -104,13 +104,20 @@ except ImportError:
 
 # ── Cached data access ──────────────────────────────────────────────
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_candles(name: str, tf: str, days: int = 5) -> pd.DataFrame:
+def fetch_today_candles(name: str, tf: str) -> pd.DataFrame:
+    """Live candles for the latest trading day only (one retry)."""
     if not broker.is_connected and not broker.login():
         return pd.DataFrame()
-    try:
-        return broker.get_candles(name, tf, days=days)
-    except Exception:
-        return pd.DataFrame()
+    for attempt in range(2):
+        try:
+            df = broker.get_candles(name, tf, days=4)
+            if not df.empty:
+                last_day = df.index[-1].date()      # most recent trading day
+                return df[df.index.date == last_day]
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -418,8 +425,8 @@ def _resample(df5: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 
 def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
-    """Live candles first; fall back to the local history cache file."""
-    df = fetch_candles(name, tf)
+    """Current-day candles, live first then the local cache (same day)."""
+    df = fetch_today_candles(name, tf)
     if not df.empty:
         if tf == "5min":          # persist live 5-min candles for resilience
             try:
@@ -428,10 +435,14 @@ def get_chart_df(name: str, tf: str) -> tuple[pd.DataFrame, str]:
             except Exception:
                 pass
         return df, "live"
+    # fallback: the most recent day from the local cache file
     hist = load_history_file(name)
-    if hist.empty:
-        return pd.DataFrame(), "none"
-    return _resample(hist, tf).tail(400), "cache"
+    if not hist.empty:
+        last_day = hist.index[-1].date()
+        day_df = hist[hist.index.date == last_day]
+        if not day_df.empty:
+            return _resample(day_df, tf), "cache"
+    return pd.DataFrame(), "none"
 
 
 def render_oi_table(name: str, chain: pd.DataFrame, spot: float) -> None:
@@ -630,7 +641,10 @@ def render_instrument(name: str, tf: str) -> None:
                 f"({pattern['status']}) — {pattern['bias']} · "
                 f"{pattern['description']}")
 
-    # ── Chart: hover price, current-price line, signal pins ────────
+    # ── Chart: current trading day, hover price, pins ──────────────
+    chart_day = dfi.index[-1].strftime("%d %b %Y")
+    st.caption(f"📅 {chart_day} — intraday ({tf}) · "
+               f"{'live' if source == 'live' else 'from cache'}")
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
                         row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
     fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["open"],
@@ -687,11 +701,6 @@ def render_instrument(name: str, tf: str) -> None:
     fig.add_hline(y=70, line_dash="dot", row=3, col=1)
     fig.add_hline(y=30, line_dash="dot", row=3, col=1)
 
-    # hide nights/weekends so candles join up like a trading terminal
-    fig.update_xaxes(rangebreaks=[
-        dict(bounds=["sat", "mon"]),
-        dict(bounds=[15.6, 9.25], pattern="hour"),
-    ])
     fig.update_layout(height=620, xaxis_rangeslider_visible=False,
                       hovermode="x unified",
                       margin=dict(l=10, r=60, t=30, b=10), showlegend=True)
@@ -765,15 +774,23 @@ def render_paper_tab() -> None:
 render_header()
 st.divider()
 
-grow_history_cache()   # throttled: builds the 5-min cache one instrument/30s
-
 tab_labels = [f"📊 {n}" for n in settings.watchlist] + ["💰 Paper Trades"]
 tabs = st.tabs(tab_labels)
 for tab, name in zip(tabs[:-1], settings.watchlist):
     with tab:
-        render_instrument(name, timeframe)
+        try:
+            render_instrument(name, timeframe)
+        except Exception as exc:  # one tab's error never blanks the others
+            st.error(f"⚠️ {name} render error: {exc}")
 with tabs[-1]:
-    render_paper_tab()
+    try:
+        render_paper_tab()
+    except Exception as exc:
+        st.error(f"⚠️ Paper Trades render error: {exc}")
+
+# Build the multi-day history cache AFTER charts render, so live candle
+# fetches get API priority. Throttled: one instrument per ~30 s.
+grow_history_cache()
 
 st.caption("⚠️ Educational tool. Options trading carries substantial risk of "
            "loss. Signals are probabilistic, not financial advice.")
