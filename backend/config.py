@@ -68,12 +68,12 @@ settings = Settings()
 # Index/stock metadata used across the system.
 INSTRUMENTS = {
     "NIFTY": {
-        "exchange": "NSE", "token": "26000", "symbol": "NIFTY",
+        "exchange": "NSE", "token": "99926000", "symbol": "Nifty 50",
         "lot_size": 75, "strike_step": 50, "option_exchange": "NFO",
         "weekly_expiry": True,
     },
     "BANKNIFTY": {
-        "exchange": "NSE", "token": "26009", "symbol": "BANKNIFTY",
+        "exchange": "NSE", "token": "99926009", "symbol": "Nifty Bank",
         "lot_size": 35, "strike_step": 100, "option_exchange": "NFO",
         "weekly_expiry": False,
     },
